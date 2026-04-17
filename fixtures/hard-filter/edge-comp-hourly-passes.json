@@ -1,0 +1,7 @@
+{
+  "name": "edge: hourly compensation is converted correctly (85/hr * 2080 = 176800 > 130000)",
+  "job": {
+    "compensation": { "min": 70, "max": 85, "currency": "USD", "interval": "hourly" }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": [] }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "edge: city matching is case-insensitive (NEW YORK matches New York)",
+  "job": {
+    "location": { "type": "hybrid", "timezone": null, "cities": ["NEW YORK"], "countries": ["usa"] }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": [] }
+}

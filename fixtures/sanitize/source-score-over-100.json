@@ -1,0 +1,5 @@
+{
+  "name": "sanitize: source_score over 100 is nulled and flagged",
+  "job": { "meta": { "source_score": 150 } },
+  "expected": { "source_score": null, "added_flags": ["source_score_invalid"] }
+}

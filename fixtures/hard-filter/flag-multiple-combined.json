@@ -1,0 +1,16 @@
+{
+  "name": "combined: sponsorship_unclear + employment_type_unclear + years_experience_missing",
+  "job": {
+    "visa_sponsorship": null,
+    "employment_type": null,
+    "years_experience": { "min": null, "max": null }
+  },
+  "profile": {
+    "work_authorization": { "requires_sponsorship": true, "visa_type": "H1B", "clearance_eligible": true }
+  },
+  "expected": {
+    "verdict": "PASS",
+    "reason": null,
+    "flags": ["sponsorship_unclear", "employment_type_unclear", "years_experience_missing"]
+  }
+}

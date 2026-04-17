@@ -1,0 +1,7 @@
+{
+  "name": "flag: compensation_missing when both min and max are null",
+  "job": {
+    "compensation": { "min": null, "max": null, "currency": null, "interval": null }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["compensation_missing"] }
+}

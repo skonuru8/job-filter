@@ -1,0 +1,6 @@
+{
+  "name": "reject: employment_type_mismatch when job is contract and profile rejects it",
+  "job": { "employment_type": "contract" },
+  "profile": { "acceptable_employment": ["full_time"] },
+  "expected": { "verdict": "REJECT", "reason": "employment_type_mismatch", "flags": [] }
+}

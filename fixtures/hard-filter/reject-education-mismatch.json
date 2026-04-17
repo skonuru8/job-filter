@@ -1,0 +1,5 @@
+{
+  "name": "reject: education_mismatch when job requires PhD and profile has bachelor",
+  "job": { "education_required": { "minimum": "phd", "field": "" } },
+  "expected": { "verdict": "REJECT", "reason": "education_mismatch", "flags": [] }
+}

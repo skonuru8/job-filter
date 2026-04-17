@@ -1,0 +1,6 @@
+{
+  "name": "flag: sponsorship_unclear when visa_sponsorship is null and profile needs sponsorship",
+  "job": { "visa_sponsorship": null },
+  "profile": { "work_authorization": { "requires_sponsorship": true, "visa_type": "H1B", "clearance_eligible": true } },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["sponsorship_unclear"] }
+}

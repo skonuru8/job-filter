@@ -1,0 +1,15 @@
+{
+  "name": "reject: location_type_mismatch when job onsite and profile rejects onsite",
+  "job": {
+    "location": { "type": "onsite", "timezone": null, "cities": ["New York"], "countries": ["USA"] }
+  },
+  "profile": {
+    "location": {
+      "current_city": "New York", "current_country": "USA", "timezone": "America/New_York",
+      "acceptable_types": ["remote"],
+      "acceptable_cities": ["New York"], "acceptable_countries": ["USA"],
+      "willing_to_relocate": false
+    }
+  },
+  "expected": { "verdict": "REJECT", "reason": "location_type_mismatch", "flags": [] }
+}

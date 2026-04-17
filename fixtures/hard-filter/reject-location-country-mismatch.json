@@ -1,0 +1,7 @@
+{
+  "name": "reject: location_country_mismatch when hybrid in unaccepted country",
+  "job": {
+    "location": { "type": "hybrid", "timezone": null, "cities": ["Toronto"], "countries": ["Canada"] }
+  },
+  "expected": { "verdict": "REJECT", "reason": "location_country_mismatch", "flags": [] }
+}

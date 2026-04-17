@@ -1,0 +1,5 @@
+{
+  "name": "flag: overqualified when profile YOE exceeds jobYoeMax + 3",
+  "job": { "years_experience": { "min": 1, "max": 2 } },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["overqualified"] }
+}

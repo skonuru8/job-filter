@@ -1,0 +1,6 @@
+{
+  "name": "post-fetch: posted_at > 30 days old → stale_posting",
+  "job": { "meta": { "posted_at": "2026-02-01T00:00:00Z" } },
+  "nowIso": "2026-04-17T00:00:00Z",
+  "expected_flags": ["stale_posting"]
+}

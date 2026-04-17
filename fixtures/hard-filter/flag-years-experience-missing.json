@@ -1,0 +1,5 @@
+{
+  "name": "flag: years_experience_missing when both min and max are null",
+  "job": { "years_experience": { "min": null, "max": null } },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["years_experience_missing"] }
+}

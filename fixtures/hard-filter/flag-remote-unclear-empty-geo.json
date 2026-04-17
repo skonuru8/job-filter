@@ -1,0 +1,15 @@
+{
+  "name": "flag: remote_unclear when onsite job has empty cities and countries",
+  "job": {
+    "location": { "type": "onsite", "timezone": null, "cities": [], "countries": [] }
+  },
+  "profile": {
+    "location": {
+      "current_city": "New York", "current_country": "USA", "timezone": "America/New_York",
+      "acceptable_types": ["remote", "hybrid", "onsite"],
+      "acceptable_cities": ["New York"], "acceptable_countries": ["USA"],
+      "willing_to_relocate": false
+    }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["remote_unclear"] }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "post-fetch: description_raw with no degree words and no structured education → no flag",
+  "job": {
+    "education_required": { "minimum": "", "field": "" },
+    "description_raw": "We seek a bright engineer with strong coding skills."
+  },
+  "nowIso": "2026-04-17T00:00:00Z",
+  "expected_flags": []
+}

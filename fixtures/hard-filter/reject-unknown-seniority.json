@@ -1,0 +1,5 @@
+{
+  "name": "reject: unknown_seniority when seniority value not in map",
+  "job": { "seniority": "wizard" },
+  "expected": { "verdict": "REJECT", "reason": "unknown_seniority", "flags": [] }
+}

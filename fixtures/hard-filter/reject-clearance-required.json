@@ -1,0 +1,6 @@
+{
+  "name": "reject: clearance_required when job requires clearance and profile not eligible",
+  "job": { "security_clearance": "secret" },
+  "profile": { "work_authorization": { "requires_sponsorship": false, "visa_type": "citizen", "clearance_eligible": false } },
+  "expected": { "verdict": "REJECT", "reason": "clearance_required", "flags": [] }
+}

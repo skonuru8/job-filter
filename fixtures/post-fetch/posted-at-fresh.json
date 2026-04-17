@@ -1,0 +1,6 @@
+{
+  "name": "post-fetch: recent posted_at (2 days ago) → no staleness flag",
+  "job": { "meta": { "posted_at": "2026-04-15T00:00:00Z" } },
+  "nowIso": "2026-04-17T00:00:00Z",
+  "expected_flags": []
+}

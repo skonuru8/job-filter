@@ -1,0 +1,5 @@
+{
+  "name": "edge: whitespace-only education.minimum is treated as absent (passes, no reject)",
+  "job": { "education_required": { "minimum": "   ", "field": "" } },
+  "expected": { "verdict": "PASS", "reason": null, "flags": [] }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "post-fetch: description_raw mentions 'bachelor' with no structured education → education_unparsed",
+  "job": {
+    "education_required": { "minimum": "", "field": "" },
+    "description_raw": "We seek a bright engineer. A Bachelor's degree in CS is required."
+  },
+  "nowIso": "2026-04-17T00:00:00Z",
+  "expected_flags": ["education_unparsed"]
+}

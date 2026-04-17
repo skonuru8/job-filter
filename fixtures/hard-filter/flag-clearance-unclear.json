@@ -1,0 +1,5 @@
+{
+  "name": "flag: clearance_unclear when clearance string not in enum",
+  "job": { "security_clearance": "not_sure" },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["clearance_unclear"] }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "flag: compensation_interval_missing when interval is not in enum",
+  "job": {
+    "compensation": { "min": 140000, "max": 180000, "currency": "USD", "interval": "biweekly" }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["compensation_interval_missing"] }
+}

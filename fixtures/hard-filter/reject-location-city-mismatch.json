@@ -1,0 +1,7 @@
+{
+  "name": "reject: location_city_mismatch when hybrid in acceptable country but unacceptable city",
+  "job": {
+    "location": { "type": "hybrid", "timezone": null, "cities": ["Chicago"], "countries": ["USA"] }
+  },
+  "expected": { "verdict": "REJECT", "reason": "location_city_mismatch", "flags": [] }
+}

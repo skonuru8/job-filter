@@ -1,0 +1,6 @@
+{
+  "name": "flag: seniority_adjacent when job is one step above profile ceiling",
+  "job": { "seniority": "staff" },
+  "profile": { "acceptable_seniority": ["mid", "senior"] },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["seniority_adjacent"] }
+}

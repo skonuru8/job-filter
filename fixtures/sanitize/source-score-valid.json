@@ -1,0 +1,5 @@
+{
+  "name": "sanitize: valid source_score (85) passes through unchanged",
+  "job": { "meta": { "source_score": 85 } },
+  "expected": { "source_score": 85, "added_flags": [] }
+}

@@ -1,0 +1,7 @@
+{
+  "name": "flag: remote_unclear when location.type is unknown-but-truthy (v2/X7 regression guard)",
+  "job": {
+    "location": { "type": "flexible", "timezone": null, "cities": [], "countries": ["USA"] }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["remote_unclear"] }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "post-fetch: null posted_at → posted_at_missing",
+  "job": { "meta": { "posted_at": null } },
+  "nowIso": "2026-04-17T00:00:00Z",
+  "expected_flags": ["posted_at_missing"]
+}

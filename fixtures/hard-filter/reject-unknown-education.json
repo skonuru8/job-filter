@@ -1,0 +1,5 @@
+{
+  "name": "reject: unknown_education_value when degree string not in map",
+  "job": { "education_required": { "minimum": "highschool", "field": "" } },
+  "expected": { "verdict": "REJECT", "reason": "unknown_education_value", "flags": [] }
+}

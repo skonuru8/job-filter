@@ -1,0 +1,9 @@
+{
+  "name": "post-fetch: structured education present → regex does not fire",
+  "job": {
+    "education_required": { "minimum": "bachelor", "field": "" },
+    "description_raw": "Master's degree nice to have."
+  },
+  "nowIso": "2026-04-17T00:00:00Z",
+  "expected_flags": []
+}

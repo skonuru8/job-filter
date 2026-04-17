@@ -1,0 +1,6 @@
+{
+  "name": "post-fetch: unparseable posted_at ('2 days ago') → posted_at_missing, not silent NaN",
+  "job": { "meta": { "posted_at": "2 days ago" } },
+  "nowIso": "2026-04-17T00:00:00Z",
+  "expected_flags": ["posted_at_missing"]
+}

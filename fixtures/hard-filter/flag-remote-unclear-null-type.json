@@ -1,0 +1,7 @@
+{
+  "name": "flag: remote_unclear when location.type is null",
+  "job": {
+    "location": { "type": null, "timezone": null, "cities": [], "countries": ["USA"] }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["remote_unclear"] }
+}

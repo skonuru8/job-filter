@@ -1,0 +1,6 @@
+{
+  "name": "reject: seniority_above_ceiling when job principal and profile tops at mid",
+  "job": { "seniority": "principal" },
+  "profile": { "acceptable_seniority": ["mid"] },
+  "expected": { "verdict": "REJECT", "reason": "seniority_above_ceiling", "flags": [] }
+}

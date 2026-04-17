@@ -1,0 +1,6 @@
+{
+  "name": "reject: no_sponsorship when job says no and profile requires it",
+  "job": { "visa_sponsorship": false },
+  "profile": { "work_authorization": { "requires_sponsorship": true, "visa_type": "H1B", "clearance_eligible": true } },
+  "expected": { "verdict": "REJECT", "reason": "no_sponsorship", "flags": [] }
+}

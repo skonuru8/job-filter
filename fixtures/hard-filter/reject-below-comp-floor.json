@@ -1,0 +1,7 @@
+{
+  "name": "reject: below_comp_floor when job max under profile minimum",
+  "job": {
+    "compensation": { "min": 80000, "max": 100000, "currency": "USD", "interval": "annual" }
+  },
+  "expected": { "verdict": "REJECT", "reason": "below_comp_floor", "flags": [] }
+}

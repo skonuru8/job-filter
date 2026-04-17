@@ -1,0 +1,5 @@
+{
+  "name": "reject: seniority_below_floor when job junior and profile accepts only mid+",
+  "job": { "seniority": "junior" },
+  "expected": { "verdict": "REJECT", "reason": "seniority_below_floor", "flags": [] }
+}

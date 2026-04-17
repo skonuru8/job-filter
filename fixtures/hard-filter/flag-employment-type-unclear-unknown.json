@@ -1,0 +1,5 @@
+{
+  "name": "flag: employment_type_unclear when employment_type is unknown string",
+  "job": { "employment_type": "internship_with_equity" },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["employment_type_unclear"] }
+}

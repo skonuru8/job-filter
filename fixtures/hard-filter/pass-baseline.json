@@ -1,0 +1,4 @@
+{
+  "name": "pass: baseline job and profile produce no flags",
+  "expected": { "verdict": "PASS", "reason": null, "flags": [] }
+}

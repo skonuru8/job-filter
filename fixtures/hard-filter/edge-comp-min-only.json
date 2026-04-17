@@ -1,0 +1,7 @@
+{
+  "name": "edge: compensation with only min (no max) falls back to min for floor check",
+  "job": {
+    "compensation": { "min": 135000, "max": null, "currency": "USD", "interval": "annual" }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": [] }
+}

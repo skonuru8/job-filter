@@ -1,0 +1,5 @@
+{
+  "name": "reject: years_experience_gap when job requires 10+ and profile has 6",
+  "job": { "years_experience": { "min": 10, "max": 15 } },
+  "expected": { "verdict": "REJECT", "reason": "years_experience_gap", "flags": [] }
+}

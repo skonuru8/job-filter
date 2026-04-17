@@ -1,0 +1,5 @@
+{
+  "name": "flag: employment_type_unclear when employment_type is null",
+  "job": { "employment_type": null },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["employment_type_unclear"] }
+}

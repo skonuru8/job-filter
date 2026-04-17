@@ -1,0 +1,16 @@
+{
+  "name": "edge: empty acceptable_cities with onsite job means country-level only (passes on country match)",
+  "job": {
+    "location": { "type": "onsite", "timezone": null, "cities": ["Seattle"], "countries": ["USA"] }
+  },
+  "profile": {
+    "location": {
+      "current_city": "New York", "current_country": "USA", "timezone": "America/New_York",
+      "acceptable_types": ["remote", "hybrid", "onsite"],
+      "acceptable_cities": [],
+      "acceptable_countries": ["USA"],
+      "willing_to_relocate": false
+    }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": [] }
+}

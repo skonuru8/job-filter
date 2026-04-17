@@ -1,0 +1,7 @@
+{
+  "name": "flag: currency_unsupported when job compensation in currency not in FX map",
+  "job": {
+    "compensation": { "min": 140000, "max": 180000, "currency": "SGD", "interval": "annual" }
+  },
+  "expected": { "verdict": "PASS", "reason": null, "flags": ["currency_unsupported"] }
+}
