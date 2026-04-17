@@ -75,6 +75,7 @@ export const FLAGS = {
   POSTED_AT_MISSING: "posted_at_missing",
   STALE_POSTING: "stale_posting",
   JUDGE_FAILED: "judge_failed",
+  THIRD_PARTY_CONTRACT: "third_party_contract",
 } as const
 
 // Destinations for final verdicts.

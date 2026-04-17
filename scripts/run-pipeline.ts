@@ -209,12 +209,9 @@ async function processJobs(
     // description_raw is "" at scrape time so this mostly flags posted_at_missing
     const checked = postFetchChecks(sanitized, nowIso);
 
-    // Merge flags from all three stages, dedup
-    const allFlags = [
-      ...(sanitized.meta?.flags ?? []),
-      ...(filterResult.flags    ?? []),
-      ...checked,
-    ];
+    // filterResult.flags already contains sanitized's flags (hardFilter copies them in).
+    // Merge with post-fetch flags and dedup.
+    const allFlags = [...new Set([...filterResult.flags, ...checked])];
 
     results.push({
       title:   sanitized.title         ?? "",
