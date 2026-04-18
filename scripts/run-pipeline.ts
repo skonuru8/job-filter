@@ -250,6 +250,8 @@ async function processJobs(
     if (DO_EXTRACT && sanitized.description_raw) {
       log(`  Extracting...`);
       const extraction = await extract(sanitized.description_raw, extractorConfig);
+      // Polite delay between LLM calls — free tier RPM is tight
+      if (DO_EXTRACT) await new Promise(r => setTimeout(r, 4000)); // wait before retry
       extractStatus = extraction.status;
 
       if (extraction.status === "ok" && extraction.fields) {
