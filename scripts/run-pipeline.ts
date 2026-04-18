@@ -26,6 +26,7 @@ import * as fs          from "fs";
 import * as path        from "path";
 import * as readline    from "readline";
 import { fileURLToPath } from "url";
+import { config } from "dotenv";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname  = path.dirname(__filename);
@@ -34,6 +35,8 @@ import { hardFilter }      from "../src/filter";
 import { postFetchChecks } from "../src/post-fetch";
 import { sanitizeJob }     from "../src/sanitize";
 import { validateProfile } from "../src/validate";
+
+config({ path: "../../.env" });
 
 // ---------------------------------------------------------------------------
 // Paths — derived from __dirname so they work regardless of cwd
