@@ -27,7 +27,6 @@ import * as fs           from "fs";
 import * as path         from "path";
 import * as readline     from "readline";
 import { fileURLToPath } from "url";
-import { config } from "dotenv";;
 
 import { hardFilter }      from "../src/filter";
 import { postFetchChecks } from "../src/post-fetch";
@@ -52,7 +51,6 @@ const SCRAPER_OUT_DIR = path.join(PROJECT_ROOT, "scraper", "output");
 const PROFILE_PATH    = path.join(PROJECT_ROOT, "config", "profile.json");
 const SKILLS_PATH     = path.join(PROJECT_ROOT, "config", "skills.json");
 const CONFIG_PATH     = path.join(PROJECT_ROOT, "config", "config.json");
-config({ path: path.join(PROJECT_ROOT, ".env") });
 
 // ---------------------------------------------------------------------------
 // Config from env
@@ -87,6 +85,7 @@ async function main(): Promise<void> {
     model:       config.llm.extractor.model       as string,
     max_tokens:  config.llm.extractor.max_tokens  as number,
     temperature: config.llm.extractor.temperature as number,
+    throttle_ms: (config.llm.extractor.throttle_ms ?? 0) as number,
   };
 
   // --- Load skill aliases ---
@@ -178,7 +177,7 @@ async function processJobs(
   jsonlPath:       string,
   profile:         unknown,
   aliases:         Record<string, string>,
-  extractorConfig: { model: string; max_tokens: number; temperature: number },
+  extractorConfig: { model: string; max_tokens: number; temperature: number; throttle_ms: number },
   nowIso:          string,
 ): Promise<JobResult[]> {
   const results: JobResult[] = [];
@@ -210,10 +209,9 @@ async function processJobs(
         company: sanitized.company?.name ?? "",
         verdict: "REJECT",
         reason:  filterResult.reason     ?? null,
-        flags:   [...new Set([
-          ...(sanitized.meta?.flags ?? []),
-          ...(filterResult.flags    ?? []),
-        ])],
+        // hardFilter copies job.meta.flags into its returned flags array,
+        // so filterResult.flags is already the union — no need to re-merge.
+        flags:   [...new Set(filterResult.flags ?? [])],
       });
       continue;  // bible: REJECTs are dropped after stage 4
     }
@@ -248,10 +246,15 @@ async function processJobs(
     let domain:    string | null = null;
 
     if (DO_EXTRACT && sanitized.description_raw) {
+      // Rate-limit between extraction calls. Delay BEFORE the call so we spread
+      // requests over time rather than dead-sleeping after every successful call.
+      // First job is not delayed (no previous call to space from).
+      if (jobNum > 1 && extractorConfig.throttle_ms > 0) {
+        await new Promise(r => setTimeout(r, extractorConfig.throttle_ms));
+      }
+
       log(`  Extracting...`);
       const extraction = await extract(sanitized.description_raw, extractorConfig);
-      // Polite delay between LLM calls — free tier RPM is tight
-      if (DO_EXTRACT) await new Promise(r => setTimeout(r, 4000)); // wait before retry
       extractStatus = extraction.status;
 
       if (extraction.status === "ok" && extraction.fields) {
@@ -271,7 +274,7 @@ async function processJobs(
         sanitized.education_required = { minimum: f.education_required.minimum, field: f.education_required.field };
         sanitized.responsibilities   = f.responsibilities;
         sanitized.visa_sponsorship   = f.visa_sponsorship;
-        sanitized.security_clearance = f.security_clearance;
+        sanitized.security_clearance = mapClearance(f.security_clearance, sanitized);
         sanitized.domain             = f.domain;
 
         log(`  Extracted: ${skills.length} skills, YOE ${yoeMin}-${yoeMax}, domain: ${domain}`);
@@ -387,6 +390,44 @@ function pad(s: string, len: number): string {
   return s.length > len ? s.slice(0, len - 1) + "…" : s.padEnd(len);
 }
 
+/**
+ * Map the extractor's security_clearance enum to the job-filter's enum.
+ *
+ * Extractor returns: "none" | "required" | "preferred" | "unknown"
+ * Filter expects:    "none" | "public_trust" | "secret" | "top_secret"
+ *
+ * Conservative policy:
+ *   "none"      → "none"            (pass through)
+ *   "required"  → "secret"          (assume worst-case clearance level)
+ *   "preferred" → "none" + flag     (don't reject; surface for LLM judge)
+ *   "unknown"   → "none" + flag     (same)
+ *
+ * The "secret" mapping for "required" will trigger the filter's
+ * CLEARANCE_REQUIRED rejection if the user's profile has clearance_eligible: false,
+ * which is the correct behavior — we should reject jobs that explicitly need
+ * a clearance the user doesn't have.
+ */
+function mapClearance(extractorValue: string, job: any): string {
+  switch (extractorValue) {
+    case "none":
+      return "none";
+    case "required":
+      return "secret";
+    case "preferred":
+    case "unknown":
+      if (!job.meta.flags.includes("clearance_unclear")) {
+        job.meta.flags.push("clearance_unclear");
+      }
+      return "none";
+    default:
+      // Unrecognized value — treat as none, flag for review
+      if (!job.meta.flags.includes("clearance_unclear")) {
+        job.meta.flags.push("clearance_unclear");
+      }
+      return "none";
+  }
+}
+
 function log(msg: string): void {
   process.stderr.write(`[pipeline] ${msg}\n`);
 }
@@ -398,7 +439,6 @@ function die(msg: string): never {
 
 // ---------------------------------------------------------------------------
 
-const DO_EXTRACT_GLOBAL = DO_EXTRACT; // referenced in processJobs closure
 main().catch(err => {
   process.stderr.write(`[pipeline] Unhandled error: ${err}\n`);
   process.exit(1);
