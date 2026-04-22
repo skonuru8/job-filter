@@ -316,6 +316,21 @@ async function processJobs(
         sanitized.security_clearance = mapClearance(f.security_clearance, sanitized);
         sanitized.domain             = f.domain;
 
+        // Clear stale flags that the hard filter set pre-extraction.
+        // Extraction may now have data that resolves the uncertainty.
+        const clearFlag = (flag: string) => {
+          sanitized.meta.flags = sanitized.meta.flags.filter((x: string) => x !== flag);
+        };
+        if (f.years_experience.min != null || f.years_experience.max != null) {
+          clearFlag("years_experience_missing");
+        }
+        if (f.visa_sponsorship != null) {
+          clearFlag("sponsorship_unclear");
+        }
+        if (f.education_required.minimum && f.education_required.minimum !== "") {
+          clearFlag("education_unparsed");
+        }
+
         log(`  Extracted: ${skills.length} skills, YOE ${yoeMin}-${yoeMax}, domain: ${domain}`);
 
         if (extraction.citation_failures && extraction.citation_failures > 0) {
@@ -359,9 +374,10 @@ async function processJobs(
       ? (scoreResult.gate_passed ? "GATE_PASS" : "ARCHIVE")
       : "PASS";
 
-    // filterResult.flags already contains sanitized's flags (hardFilter copies them in).
-    // Merge with post-fetch flags and dedup.
-    const allFlags = [...new Set([...filterResult.flags, ...checked])];
+    // sanitized.meta.flags is the live flag set — cleaned up after extraction
+    // resolved earlier-flagged uncertainty. filterResult.flags is stale
+    // (snapshotted before extraction). Merge live flags with post-fetch checks.
+    const allFlags = [...new Set([...(sanitized.meta?.flags ?? []), ...checked])];
 
     results.push({
       title:          sanitized.title         ?? "",
