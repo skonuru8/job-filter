@@ -23,13 +23,12 @@
  *   SCORE=1             enable scoring (auto-enabled when EXTRACT=1)
  */
 
-import "dotenv/config";
-
 import { spawnSync }     from "child_process";
 import * as fs           from "fs";
 import * as path         from "path";
 import * as readline     from "readline";
 import { fileURLToPath } from "url";
+import { config as loadEnv } from "dotenv";
 
 import { hardFilter }      from "../src/filter";
 import { postFetchChecks } from "../src/post-fetch";
@@ -58,6 +57,9 @@ const PROFILE_PATH    = path.join(PROJECT_ROOT, "config", "profile.json");
 const SKILLS_PATH     = path.join(PROJECT_ROOT, "config", "skills.json");
 const CONFIG_PATH     = path.join(PROJECT_ROOT, "config", "config.json");
 
+// Load .env from project root (dotenv/config searches cwd which may differ)
+loadEnv({ path: path.join(PROJECT_ROOT, ".env") });
+
 // ---------------------------------------------------------------------------
 // Config from env
 // ---------------------------------------------------------------------------
@@ -68,6 +70,8 @@ const HEADED         = Boolean(process.env.HEADED);
 const JSONL_OVERRIDE = process.env.JSONL   ?? "";
 const DO_EXTRACT     = Boolean(process.env.EXTRACT);   // opt-in — costs LLM calls
 const DO_SCORE       = DO_EXTRACT || Boolean(process.env.SCORE);  // auto when extract runs
+const SAVE_FIXTURES  = Boolean(process.env.SAVE_FIXTURES); // save real extraction fixtures
+const FIXTURES_DIR   = path.join(PROJECT_ROOT, "extractor", "fixtures");
 const RUN_ID = new Date().toISOString().replace(/[:.]/g, "-");
 
 // ---------------------------------------------------------------------------
@@ -229,6 +233,11 @@ async function processJobs(
     input: fs.createReadStream(jsonlPath, "utf-8"), crlfDelay: Infinity,
   });
 
+  // Count existing real fixtures so we number new ones correctly
+  let fixtureCount = SAVE_FIXTURES
+    ? fs.readdirSync(FIXTURES_DIR).filter(f => f.startsWith("jd-real-") && f.endsWith("-input.txt")).length
+    : 0;
+
   let jobNum = 0;
   for await (const line of rl) {
     const trimmed = line.trim();
@@ -335,6 +344,18 @@ async function processJobs(
 
         if (extraction.citation_failures && extraction.citation_failures > 0) {
           log(`  Citation failures: ${extraction.citation_failures}`);
+        }
+
+        // Save real fixture pair when SAVE_FIXTURES=1 (up to 5 per run)
+        if (SAVE_FIXTURES && fixtureCount < 5 && sanitized.description_raw?.trim()) {
+          fixtureCount++;
+          const slug = (sanitized.title ?? "job")
+            .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 35);
+          const n      = String(fixtureCount).padStart(3, "0");
+          const prefix = `jd-real-${n}-${slug}`;
+          fs.writeFileSync(path.join(FIXTURES_DIR, `${prefix}-input.txt`),  sanitized.description_raw);
+          fs.writeFileSync(path.join(FIXTURES_DIR, `${prefix}-expected.json`), JSON.stringify(extraction.fields, null, 2));
+          log(`  Fixture saved: ${prefix}`);
         }
       } else {
         log(`  Extraction failed: ${extraction.error}`);
