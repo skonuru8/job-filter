@@ -87,9 +87,12 @@ const DO_JUDGE       = DO_EXTRACT || Boolean(process.env.JUDGE);  // auto when e
 const DO_COVER       = DO_EXTRACT || Boolean(process.env.COVER);  // auto when extract runs
 const SAVE_FIXTURES  = Boolean(process.env.SAVE_FIXTURES); // save real extraction fixtures
 const FIXTURES_DIR   = path.join(PROJECT_ROOT, "extractor", "fixtures");
-const COVER_OUT_DIR  = path.join(PROJECT_ROOT, "output", "cover-letters");
 const CONFIG_DIR     = path.join(PROJECT_ROOT, "config");
 const RUN_ID = new Date().toISOString().replace(/[:.]/g, "-");
+// Each run gets its own subdirectory — old runs are never touched.
+// Bucket subfolders (COVER_LETTER / REVIEW_QUEUE) let you triage at a glance.
+const COVER_OUT_BASE = path.join(PROJECT_ROOT, "output", "cover-letters");
+const COVER_OUT_DIR  = path.join(COVER_OUT_BASE, RUN_ID);
 
 // ---------------------------------------------------------------------------
 // Main
@@ -133,6 +136,7 @@ async function main(): Promise<void> {
     max_tokens:  config.llm.cover_letter.max_tokens  as number,
     temperature: config.llm.cover_letter.temperature as number,
     throttle_ms: (config.llm.cover_letter.throttle_ms ?? 1000) as number,
+    review_queue_threshold: (config.llm.cover_letter.review_queue_threshold ?? 0.70) as number,
     ...(config.llm.cover_letter.thinking
       ? { thinking: config.llm.cover_letter.thinking as { type: "enabled"; budget_tokens: number } }
       : {}),
@@ -253,6 +257,7 @@ function findNewestJsonl(source: string): string | null {
 interface JobResult {
   title:         string;
   company:       string;
+  source_url?:   string | null;
   verdict:       string;   // REJECT | PASS | GATE_PASS | ARCHIVE
   reason:        string | null;
   flags:         string[];
@@ -270,7 +275,7 @@ interface JobResult {
   judge_reasoning?: string | null;
   judge_concerns?:  string[];
   bucket?:          FinalBucket;
-  // Populated after cover letter (Stage 15, only for COVER_LETTER bucket)
+  // Populated after cover letter (Stage 15)
   cover_letter_path?: string | null;
   cover_letter_words?: number | null;
 }
@@ -330,11 +335,12 @@ async function processJobs(
       rejects.push({
         jobNum: n,
         result: {
-          title:   sanitized.title         ?? "",
-          company: sanitized.company?.name ?? "",
-          verdict: "REJECT",
-          reason:  filterResult.reason     ?? null,
-          flags:   [...new Set(filterResult.flags ?? [])],
+          title:      sanitized.title         ?? "",
+          company:    sanitized.company?.name ?? "",
+          source_url: sanitized.meta?.source_url ?? null,
+          verdict:    "REJECT",
+          reason:     filterResult.reason     ?? null,
+          flags:      [...new Set(filterResult.flags ?? [])],
         },
       });
       continue;  // bible: REJECTs are dropped after stage 4
@@ -565,11 +571,21 @@ async function processJobs(
       }
     }
 
-    // Stage 15 — Cover letter (COVER_LETTER bucket only)
+    // Stage 15 — Cover letter
+    // Always: COVER_LETTER bucket.
+    // Also: REVIEW_QUEUE jobs with score >= review_queue_threshold get a draft.
+    //   Bucket stays REVIEW_QUEUE — human still reviews judge concerns before sending.
+    //   Set review_queue_threshold: 1.0 in config to disable this behaviour.
     let coverLetterPath: string | null  = null;
     let coverLetterWords: number | null = null;
 
-    if (DO_COVER && bucket === "COVER_LETTER" && scoreResult) {
+    const rvqThreshold = coverLetterConfigArg.review_queue_threshold ?? 0.70;
+    const shouldWriteLetter = DO_COVER && scoreResult && (
+      bucket === "COVER_LETTER" ||
+      (bucket === "REVIEW_QUEUE" && scoreResult.score >= rvqThreshold)
+    );
+
+    if (shouldWriteLetter) {
       if (coverLetterConfigArg.throttle_ms > 0) {
         await new Promise(r => setTimeout(r, coverLetterConfigArg.throttle_ms));
       }
@@ -591,13 +607,13 @@ async function processJobs(
           yoe_min:          sanitized.years_experience?.min ?? null,
           yoe_max:          sanitized.years_experience?.max ?? null,
           visa_sponsorship: sanitized.visa_sponsorship ?? null,
-          score:            scoreResult.score,
+          score:            scoreResult!.score,
           score_components: {
-            skills:    scoreResult.components.skills,
-            semantic:  scoreResult.components.semantic,
-            yoe:       scoreResult.components.yoe,
-            seniority: scoreResult.components.seniority,
-            location:  scoreResult.components.location,
+            skills:    scoreResult!.components.skills,
+            semantic:  scoreResult!.components.semantic,
+            yoe:       scoreResult!.components.yoe,
+            seniority: scoreResult!.components.seniority,
+            location:  scoreResult!.components.location,
           },
           judge_reasoning: judgeResult?.fields?.reasoning ?? null,
           judge_concerns:  judgeResult?.fields?.concerns  ?? [],
@@ -614,7 +630,10 @@ async function processJobs(
       const clResult = await generateCoverLetter(clInput, coverLetterConfigArg);
       if (clResult.status === "ok" && clResult.text) {
         try {
-          coverLetterPath  = saveCoverLetter(clResult, clInput, COVER_OUT_DIR);
+          // Route into bucket subfolder so COVER_LETTER and REVIEW_QUEUE are separate.
+          const bucketLabel = bucket === "COVER_LETTER" ? "COVER_LETTER" : "REVIEW_QUEUE";
+          const clOutDir    = path.join(COVER_OUT_DIR, bucketLabel);
+          coverLetterPath   = saveCoverLetter(clResult, clInput, clOutDir);
           coverLetterWords = clResult.word_count ?? null;
           log(`[${n}]  Cover letter: ${coverLetterPath} (${coverLetterWords} words)`);
         } catch (e) {
@@ -632,6 +651,7 @@ async function processJobs(
       result: {
         title:               sanitized.title         ?? "",
         company:             sanitized.company?.name ?? "",
+        source_url:          sanitized.meta?.source_url ?? null,
         verdict:             finalVerdict,
         reason:              null,
         flags:               allFlags,
