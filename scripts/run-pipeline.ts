@@ -32,9 +32,9 @@
 import { spawnSync }     from "child_process";
 import * as fs           from "fs";
 import * as path         from "path";
-import * as readline     from "readline";
 import { fileURLToPath } from "url";
 import { config as loadEnv } from "dotenv";
+import pLimit            from "p-limit";
 
 import { hardFilter }      from "../src/filter";
 import { postFetchChecks } from "../src/post-fetch";
@@ -115,12 +115,18 @@ async function main(): Promise<void> {
     max_tokens:  config.llm.extractor.max_tokens  as number,
     temperature: config.llm.extractor.temperature as number,
     throttle_ms: (config.llm.extractor.throttle_ms ?? 0) as number,
+    ...(config.llm.extractor.reasoning
+      ? { reasoning: config.llm.extractor.reasoning as Record<string, unknown> }
+      : {}),
   };
   const judgeConfig = {
     model:       config.llm.judge.model       as string,
     max_tokens:  config.llm.judge.max_tokens  as number,
     temperature: config.llm.judge.temperature as number,
     throttle_ms: (config.llm.judge.throttle_ms ?? 600) as number,
+    ...(config.llm.judge.reasoning
+      ? { reasoning: config.llm.judge.reasoning as Record<string, unknown> }
+      : {}),
   };
   const coverLetterConfig: CoverLetterConfig = {
     model:       config.llm.cover_letter.model       as string,
@@ -273,8 +279,8 @@ async function processJobs(
   jsonlPath:           string,
   profile:             unknown,
   aliases:             Record<string, string>,
-  extractorConfig:     { model: string; max_tokens: number; temperature: number; throttle_ms: number },
-  judgeConfigArg:      { model: string; max_tokens: number; temperature: number; throttle_ms: number },
+  extractorConfig:     { model: string; max_tokens: number; temperature: number; throttle_ms: number; reasoning?: Record<string, unknown> },
+  judgeConfigArg:      { model: string; max_tokens: number; temperature: number; throttle_ms: number; reasoning?: Record<string, unknown> },
   coverLetterConfigArg: CoverLetterConfig,
   scoringWeights:      ScoringWeights,
   scoringThreshold:    number,
@@ -282,19 +288,28 @@ async function processJobs(
   resumeText:          string | null,
   nowIso:              string,
 ): Promise<JobResult[]> {
-  const results: JobResult[] = [];
+  // ---------------------------------------------------------------------------
+  // Phase 1 — read all JSONL lines + synchronous sanitize/hard-filter
+  //
+  // Reading everything first gives every job a stable number before any async
+  // work starts. No readline streaming: we need the full list to fan out.
+  // ---------------------------------------------------------------------------
+  const rawLines = fs.readFileSync(jsonlPath, "utf-8").split(/\r?\n/);
 
-  const rl = readline.createInterface({
-    input: fs.createReadStream(jsonlPath, "utf-8"), crlfDelay: Infinity,
-  });
+  // Shared fixture counter. Increment is always in a synchronous block after
+  // an await, so JS single-threaded scheduling keeps it race-free.
+  const fixtureRef = {
+    count: SAVE_FIXTURES
+      ? fs.readdirSync(FIXTURES_DIR).filter(f => f.startsWith("jd-real-") && f.endsWith("-input.txt")).length
+      : 0,
+  };
 
-  // Count existing real fixtures so we number new ones correctly
-  let fixtureCount = SAVE_FIXTURES
-    ? fs.readdirSync(FIXTURES_DIR).filter(f => f.startsWith("jd-real-") && f.endsWith("-input.txt")).length
-    : 0;
+  interface PassEntry { jobNum: number; sanitized: any }
+  const rejects:   Array<{ jobNum: number; result: JobResult }> = [];
+  const passQueue: PassEntry[] = [];
 
   let jobNum = 0;
-  for await (const line of rl) {
+  for (const line of rawLines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
 
@@ -303,6 +318,7 @@ async function processJobs(
     catch { log(`Skipping malformed line`); continue; }
 
     jobNum++;
+    const n = jobNum;
 
     // Stage 3 — sanitize
     const sanitized = sanitizeJob(raw);
@@ -311,118 +327,141 @@ async function processJobs(
     const filterResult = hardFilter(sanitized, profile as any);
 
     if (filterResult.verdict === "REJECT") {
-      results.push({
-        title:   sanitized.title         ?? "",
-        company: sanitized.company?.name ?? "",
-        verdict: "REJECT",
-        reason:  filterResult.reason     ?? null,
-        flags:   [...new Set(filterResult.flags ?? [])],
+      rejects.push({
+        jobNum: n,
+        result: {
+          title:   sanitized.title         ?? "",
+          company: sanitized.company?.name ?? "",
+          verdict: "REJECT",
+          reason:  filterResult.reason     ?? null,
+          flags:   [...new Set(filterResult.flags ?? [])],
+        },
       });
       continue;  // bible: REJECTs are dropped after stage 4
     }
 
-    // --- PASS — continue through pipeline ---
-    log(`[${jobNum}] PASS: ${sanitized.title} @ ${sanitized.company?.name}`);
+    log(`[${n}] PASS: ${sanitized.title} @ ${sanitized.company?.name}`);
+    passQueue.push({ jobNum: n, sanitized });
+  }
 
-    // Stage 5 — fetch JD
-    let fetchStatus = "skipped";
-    if (DO_EXTRACT) {
-      log(`  Fetching: ${sanitized.meta?.source_url}`);
-      const fetchResult = await fetchJobPage(sanitized.meta?.source_url ?? "");
-      fetchStatus = fetchResult.status;
+  // ---------------------------------------------------------------------------
+  // Phase 2 — concurrent async processing of PASS jobs (fetch→extract→score→judge)
+  //
+  // pLimit(3): at most 3 jobs running concurrently. Keeps Dice HTTP and
+  // OpenRouter LLM load reasonable without serialising everything.
+  // ---------------------------------------------------------------------------
+  const limit = pLimit(5);
 
-      if (fetchResult.status === "ok") {
-        sanitized.description_raw = fetchResult.description_raw;
-        log(`  Fetched: ${fetchResult.description_raw.length} chars`);
-      } else {
-        log(`  Fetch failed: ${fetchResult.error}`);
-        sanitized.meta.flags.push("fetch_failed");
-      }
-    }
+  const passPromises = passQueue.map(({ jobNum: n, sanitized }) =>
+    limit(async (): Promise<{ jobNum: number; result: JobResult }> => {
 
-    // Stage 6 — post-fetch checks (now has real description_raw if fetched)
-    const checked = postFetchChecks(sanitized, nowIso);
+      // Stage 5 — fetch JD
+      let fetchStatus = "skipped";
+      if (DO_EXTRACT) {
+        log(`[${n}]  Fetching: ${sanitized.meta?.source_url}`);
+        const fetchResult = await fetchJobPage(sanitized.meta?.source_url ?? "");
+        fetchStatus = fetchResult.status;
 
-    // Stage 7 — extract structured fields
-    let extractStatus = "skipped";
-    let skills:    string[]     = [];
-    let yoeMin:    number | null = null;
-    let yoeMax:    number | null = null;
-    let domain:    string | null = null;
-
-    if (DO_EXTRACT && sanitized.description_raw) {
-      // Throttle BEFORE call (bible fix: throttle before, not after)
-      if (jobNum > 1 && extractorConfig.throttle_ms > 0) {
-        await new Promise(r => setTimeout(r, extractorConfig.throttle_ms));
+        if (fetchResult.status === "ok") {
+          sanitized.description_raw = fetchResult.description_raw;
+          log(`[${n}]  Fetched: ${fetchResult.description_raw.length} chars`);
+        } else {
+          log(`[${n}]  Fetch failed: ${fetchResult.error}`);
+          sanitized.meta.flags.push("fetch_failed");
+        }
       }
 
-      log(`  Extracting...`);
-      const extraction = await extract(sanitized.description_raw, extractorConfig);
-      extractStatus = extraction.status;
+      // Stage 6 — post-fetch checks (now has real description_raw if fetched)
+      const checked = postFetchChecks(sanitized, nowIso);
 
-      if (extraction.status === "ok" && extraction.fields) {
-        const f = extraction.fields;
+      // Stage 7 — extract structured fields
+      let extractStatus = "skipped";
+      let skills:    string[]     = [];
+      let yoeMin:    number | null = null;
+      let yoeMax:    number | null = null;
+      let domain:    string | null = null;
 
-        // Stage 10 — normalize skill names through alias map
-        skills = f.required_skills.map(s => normalizeSkill(s.name, aliases));
-        yoeMin = f.years_experience.min;
-        yoeMax = f.years_experience.max;
-        domain = f.domain;
-
-        // Write extracted fields back onto job for downstream use
-        sanitized.required_skills    = f.required_skills.map(s => ({
-          ...s, name: normalizeSkill(s.name, aliases),
-        }));
-        sanitized.years_experience   = { min: f.years_experience.min, max: f.years_experience.max };
-        sanitized.education_required = { minimum: f.education_required.minimum, field: f.education_required.field };
-        sanitized.responsibilities   = f.responsibilities;
-        sanitized.visa_sponsorship   = f.visa_sponsorship;
-        sanitized.security_clearance = mapClearance(f.security_clearance, sanitized);
-        sanitized.domain             = f.domain;
-
-        // Clear stale flags that the hard filter set pre-extraction.
-        // Extraction may now have data that resolves the uncertainty.
-        const clearFlag = (flag: string) => {
-          sanitized.meta.flags = sanitized.meta.flags.filter((x: string) => x !== flag);
-        };
-        if (f.years_experience.min != null || f.years_experience.max != null) {
-          clearFlag("years_experience_missing");
-        }
-        if (f.visa_sponsorship != null) {
-          clearFlag("sponsorship_unclear");
-        }
-        if (f.education_required.minimum && f.education_required.minimum !== "") {
-          clearFlag("education_unparsed");
+      if (DO_EXTRACT && sanitized.description_raw) {
+        // Small courtesy pause — not rate-limit critical with reasoning disabled,
+        // but avoids bursting all 3 concurrent slots simultaneously.
+        if (extractorConfig.throttle_ms > 0) {
+          await new Promise(r => setTimeout(r, extractorConfig.throttle_ms));
         }
 
-        log(`  Extracted: ${skills.length} skills, YOE ${yoeMin}-${yoeMax}, domain: ${domain}`);
+        log(`[${n}]  Extracting...`);
+        const extraction = await extract(sanitized.description_raw, extractorConfig);
+        extractStatus = extraction.status;
 
-        if (extraction.citation_failures && extraction.citation_failures > 0) {
-          log(`  Citation failures: ${extraction.citation_failures}`);
-        }
+        if (extraction.status === "ok" && extraction.fields) {
+          const f = extraction.fields;
 
-        // Save real fixture pair when SAVE_FIXTURES=1 (up to 5 per run)
-        if (SAVE_FIXTURES && fixtureCount < 5 && sanitized.description_raw?.trim()) {
-          fixtureCount++;
-          const slug = (sanitized.title ?? "job")
-            .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 35);
-          const n      = String(fixtureCount).padStart(3, "0");
-          const prefix = `jd-real-${n}-${slug}`;
-          fs.writeFileSync(path.join(FIXTURES_DIR, `${prefix}-input.txt`),  sanitized.description_raw);
-          fs.writeFileSync(path.join(FIXTURES_DIR, `${prefix}-expected.json`), JSON.stringify(extraction.fields, null, 2));
-          log(`  Fixture saved: ${prefix}`);
+          // Stage 10 — normalize skill names through alias map
+          skills = f.required_skills.map(s => normalizeSkill(s.name, aliases));
+          yoeMin = f.years_experience.min;
+          yoeMax = f.years_experience.max;
+          domain = f.domain;
+
+          // Write extracted fields back onto job for downstream use
+          sanitized.required_skills    = f.required_skills.map(s => ({
+            ...s, name: normalizeSkill(s.name, aliases),
+          }));
+          sanitized.years_experience   = { min: f.years_experience.min, max: f.years_experience.max };
+          sanitized.education_required = { minimum: f.education_required.minimum, field: f.education_required.field };
+          sanitized.responsibilities   = f.responsibilities;
+          sanitized.visa_sponsorship   = f.visa_sponsorship;
+          sanitized.security_clearance = mapClearance(f.security_clearance, sanitized);
+          sanitized.domain             = f.domain;
+
+          // Clear stale flags that the hard filter set pre-extraction.
+          // Extraction may now have data that resolves the uncertainty.
+          const clearFlag = (flag: string) => {
+            sanitized.meta.flags = sanitized.meta.flags.filter((x: string) => x !== flag);
+          };
+          if (f.years_experience.min != null || f.years_experience.max != null) {
+            clearFlag("years_experience_missing");
+          }
+          if (f.visa_sponsorship != null) {
+            clearFlag("sponsorship_unclear");
+          }
+          if (f.education_required.minimum && f.education_required.minimum !== "") {
+            clearFlag("education_unparsed");
+          }
+
+          log(`[${n}]  Extracted: ${skills.length} skills, YOE ${yoeMin}-${yoeMax}, domain: ${domain}`);
+
+          if (extraction.citation_failures && extraction.citation_failures > 0) {
+            log(`[${n}]  Citation failures: ${extraction.citation_failures}`);
+          }
+
+          // Save real fixture pair when SAVE_FIXTURES=1 (up to 5 per run).
+          // check+increment are in a synchronous block — JS single-threaded
+          // scheduling keeps this race-free even with concurrent tasks.
+          if (SAVE_FIXTURES && fixtureRef.count < 5 && sanitized.description_raw?.trim()) {
+            fixtureRef.count++;
+            const slug   = (sanitized.title ?? "job")
+              .toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 35);
+            const num    = String(fixtureRef.count).padStart(3, "0");
+            const prefix = `jd-real-${num}-${slug}`;
+            fs.writeFileSync(path.join(FIXTURES_DIR, `${prefix}-input.txt`),  sanitized.description_raw);
+            fs.writeFileSync(path.join(FIXTURES_DIR, `${prefix}-expected.json`), JSON.stringify(extraction.fields, null, 2));
+            log(`[${n}]  Fixture saved: ${prefix}`);
+          }
+        } else {
+          log(`[${n}]  Extraction failed: ${extraction.error}`);
+          sanitized.meta.flags.push("extraction_failed");
         }
-      } else {
-        log(`  Extraction failed: ${extraction.error}`);
-        sanitized.meta.flags.push("extraction_failed");
       }
-    }
 
     // Stage 11 — deterministic scoring
     // Runs when DO_SCORE is set. Requires extraction for best results;
     // without it, skills/YOE components will be 0 (no data to compare).
+    //
+    // Skip scoring when extraction was attempted but failed: without skills
+    // data, scoreSkills() returns 1.0 (no bar = perfect match) which produces
+    // a misleading ~0.85 score and wastes a downstream judge LLM call.
+    const extractionFailed = DO_EXTRACT && extractStatus === "error";
     let scoreResult: ScoreResult | undefined;
-    if (DO_SCORE) {
+    if (DO_SCORE && !extractionFailed) {
       let jobEmbedding: Float32Array | null = null;
       try {
         jobEmbedding = await embedJob(sanitized);
@@ -439,16 +478,21 @@ async function processJobs(
         scoringThreshold,
       );
 
-      log(`  Score: ${scoreResult.score.toFixed(3)} (gate: ${scoreResult.gate_passed ? "PASS" : "FAIL"}) | skills=${scoreResult.components.skills.toFixed(2)} yoe=${scoreResult.components.yoe.toFixed(2)} sen=${scoreResult.components.seniority.toFixed(2)} loc=${scoreResult.components.location.toFixed(2)} sem=${scoreResult.components.semantic.toFixed(2)}`);
+          log(`[${n}]  Score: ${scoreResult.score.toFixed(3)} (gate: ${scoreResult.gate_passed ? "PASS" : "FAIL"}) | skills=${scoreResult.components.skills.toFixed(2)} yoe=${scoreResult.components.yoe.toFixed(2)} sen=${scoreResult.components.seniority.toFixed(2)} loc=${scoreResult.components.location.toFixed(2)} sem=${scoreResult.components.semantic.toFixed(2)}`);
+    } else if (extractionFailed) {
+      log(`[${n}]  Score: skipped (extraction failed) → routing to ARCHIVE`);
     }
 
     // Stage 12 — threshold gate
     // gate_passed jobs proceed to the LLM judge.
     // gate_fail → ARCHIVE bucket.
+    // extraction_failed → ARCHIVE (no reliable data to judge on).
     // When scoring is disabled, all PASS jobs go through as PASS (no gate).
-    const gateVerdict = scoreResult
-      ? (scoreResult.gate_passed ? "GATE_PASS" : "ARCHIVE")
-      : "PASS";
+    const gateVerdict = extractionFailed
+      ? "ARCHIVE"
+      : scoreResult
+        ? (scoreResult.gate_passed ? "GATE_PASS" : "ARCHIVE")
+        : "PASS";
 
     // sanitized.meta.flags is the live flag set — cleaned up after extraction
     // resolved earlier-flagged uncertainty. filterResult.flags is stale
@@ -457,7 +501,10 @@ async function processJobs(
 
     // Stage 13–14 — LLM judge + routing (GATE_PASS only)
     let judgeResult: JudgeResult | undefined;
-    let bucket: FinalBucket | undefined;
+    // Seed bucket from gate verdict so ARCHIVE (gate_fail / extraction_failed)
+    // lands in the archive bucket for the summary — only GATE_PASS paths
+    // reassign bucket after the judge runs.
+    let bucket: FinalBucket | undefined = gateVerdict === "ARCHIVE" ? "ARCHIVE" : undefined;
     let finalVerdict = gateVerdict;
 
     if (DO_JUDGE && gateVerdict === "GATE_PASS" && scoreResult) {
@@ -466,7 +513,7 @@ async function processJobs(
         await new Promise(r => setTimeout(r, judgeConfigArg.throttle_ms));
       }
 
-      log(`  Judging...`);
+      log(`[${n}]  Judging...`);
       const judgeInput: JudgeInput = {
         job: {
           title:             sanitized.title          ?? "",
@@ -508,12 +555,12 @@ async function processJobs(
       finalVerdict = gateVerdict;   // still GATE_PASS for the raw record; bucket is the real routing
 
       if (judgeResult.status === "ok") {
-        log(`  Judge: ${judgeResult.verdict} → ${bucket}`);
+        log(`[${n}]  Judge: ${judgeResult.verdict} → ${bucket}`);
         if (judgeResult.fields?.concerns.length) {
-          log(`  Concerns: ${judgeResult.fields.concerns.join("; ")}`);
+          log(`[${n}]  Concerns: ${judgeResult.fields.concerns.join("; ")}`);
         }
       } else {
-        log(`  Judge error: ${judgeResult.error} → ${bucket}`);
+        log(`[${n}]  Judge error: ${judgeResult.error} → ${bucket}`);
         allFlags.push("judge_failed");
       }
     }
@@ -527,7 +574,7 @@ async function processJobs(
         await new Promise(r => setTimeout(r, coverLetterConfigArg.throttle_ms));
       }
 
-      log(`  Writing cover letter...`);
+      log(`[${n}]  Writing cover letter...`);
       const clInput: CoverLetterInput = {
         job: {
           job_id:           sanitized.meta?.job_id ?? `job-${jobNum}`,
@@ -569,40 +616,47 @@ async function processJobs(
         try {
           coverLetterPath  = saveCoverLetter(clResult, clInput, COVER_OUT_DIR);
           coverLetterWords = clResult.word_count ?? null;
-          log(`  Cover letter: ${coverLetterPath} (${coverLetterWords} words)`);
+          log(`[${n}]  Cover letter: ${coverLetterPath} (${coverLetterWords} words)`);
         } catch (e) {
-          log(`  Cover letter save failed: ${e}`);
+          log(`[${n}]  Cover letter save failed: ${e}`);
           allFlags.push("cover_letter_save_failed");
         }
       } else {
-        log(`  Cover letter generation failed: ${clResult.error}`);
+        log(`[${n}]  Cover letter generation failed: ${clResult.error}`);
         allFlags.push("cover_letter_failed");
       }
     }
 
-    results.push({
-      title:               sanitized.title         ?? "",
-      company:             sanitized.company?.name ?? "",
-      verdict:             finalVerdict,
-      reason:              null,
-      flags:               allFlags,
-      skills:              skills.length ? skills : undefined,
-      yoe_min:             yoeMin,
-      yoe_max:             yoeMax,
-      domain:              domain ?? undefined,
-      fetch_status:        fetchStatus,
-      extract_status:      extractStatus,
-      score:               scoreResult,
-      judge_verdict:       judgeResult?.verdict   ?? null,
-      judge_reasoning:     judgeResult?.fields?.reasoning ?? null,
-      judge_concerns:      judgeResult?.fields?.concerns  ?? [],
-      bucket,
-      cover_letter_path:   coverLetterPath,
-      cover_letter_words:  coverLetterWords,
-    });
-  }
+    return {
+      jobNum: n,
+      result: {
+        title:               sanitized.title         ?? "",
+        company:             sanitized.company?.name ?? "",
+        verdict:             finalVerdict,
+        reason:              null,
+        flags:               allFlags,
+        skills:              skills.length ? skills : undefined,
+        yoe_min:             yoeMin,
+        yoe_max:             yoeMax,
+        domain:              domain ?? undefined,
+        fetch_status:        fetchStatus,
+        extract_status:      extractStatus,
+        score:               scoreResult,
+        judge_verdict:       judgeResult?.verdict   ?? null,
+        judge_reasoning:     judgeResult?.fields?.reasoning ?? null,
+        judge_concerns:      judgeResult?.fields?.concerns  ?? [],
+        bucket,
+        cover_letter_path:   coverLetterPath,
+        cover_letter_words:  coverLetterWords,
+      },
+    };
+  })); // end limit()
 
-  return results;
+  // Merge rejects + pass results, sort by original jobNum to preserve input order
+  const passResults = await Promise.all(passPromises);
+  return [...rejects, ...passResults]
+    .sort((a, b) => a.jobNum - b.jobNum)
+    .map(r => r.result);
 }
 
 // ---------------------------------------------------------------------------
