@@ -1,5 +1,5 @@
 /**
- * run-pipeline.ts — Milestone 3 end-to-end pipeline.
+ * run-pipeline.ts — Milestone 6 end-to-end pipeline.
  *
  * Bible §5 stages wired in order:
  *   Stage 3  — sanitizeJob
@@ -10,6 +10,9 @@
  *   Stage 10 — normalizeSkills  (alias map lookup)
  *   Stage 11 — scoreJob         (deterministic 5-component scoring)
  *   Stage 12 — gate             (score >= threshold → GATE_PASS, else ARCHIVE)
+ *   Stage 13 — judge            (LLM verdict: STRONG | MAYBE | WEAK)
+ *   Stage 14 — route            (COVER_LETTER | RESULTS | REVIEW_QUEUE | ARCHIVE)
+ *   Stage 15 — cover letter     (COVER_LETTER bucket only → output/cover-letters/)
  *
  * Run from project root:
  *   npx tsx job-filter/scripts/run-pipeline.ts
@@ -21,6 +24,9 @@
  *   JSONL=/path/file    skip scrape, read existing JSONL directly
  *   EXTRACT=1           enable LLM extraction (default: off — costs API calls)
  *   SCORE=1             enable scoring (auto-enabled when EXTRACT=1)
+ *   JUDGE=1             enable LLM judge (auto-enabled when EXTRACT=1)
+ *   COVER=1             enable cover letter generation (auto-enabled when EXTRACT=1)
+ *   QUERY="java developer"  Dice search query (default: "full stack developer")
  */
 
 import { spawnSync }     from "child_process";
@@ -41,6 +47,13 @@ import { extract }       from "../../extractor/src/extract";
 import { scoreJob }      from "../../scorer/src/score";
 import { embedJob, embedProfile } from "../../scorer/src/embed";
 import type { ScoringWeights, ScoreResult } from "../../scorer/src/types";
+
+import { judge, getBucket } from "../../judge/src/judge";
+import type { JudgeInput, JudgeResult, FinalBucket } from "../../judge/src/types";
+
+import { generateCoverLetter, saveCoverLetter } from "../../cover-letter/src/generate";
+import { loadResume } from "../../cover-letter/src/resume";
+import type { CoverLetterInput, CoverLetterConfig } from "../../cover-letter/src/types";
 
 
 // ---------------------------------------------------------------------------
@@ -70,8 +83,12 @@ const HEADED         = Boolean(process.env.HEADED);
 const JSONL_OVERRIDE = process.env.JSONL   ?? "";
 const DO_EXTRACT     = Boolean(process.env.EXTRACT);   // opt-in — costs LLM calls
 const DO_SCORE       = DO_EXTRACT || Boolean(process.env.SCORE);  // auto when extract runs
+const DO_JUDGE       = DO_EXTRACT || Boolean(process.env.JUDGE);  // auto when extract runs
+const DO_COVER       = DO_EXTRACT || Boolean(process.env.COVER);  // auto when extract runs
 const SAVE_FIXTURES  = Boolean(process.env.SAVE_FIXTURES); // save real extraction fixtures
 const FIXTURES_DIR   = path.join(PROJECT_ROOT, "extractor", "fixtures");
+const COVER_OUT_DIR  = path.join(PROJECT_ROOT, "output", "cover-letters");
+const CONFIG_DIR     = path.join(PROJECT_ROOT, "config");
 const RUN_ID = new Date().toISOString().replace(/[:.]/g, "-");
 
 // ---------------------------------------------------------------------------
@@ -99,6 +116,21 @@ async function main(): Promise<void> {
     temperature: config.llm.extractor.temperature as number,
     throttle_ms: (config.llm.extractor.throttle_ms ?? 0) as number,
   };
+  const judgeConfig = {
+    model:       config.llm.judge.model       as string,
+    max_tokens:  config.llm.judge.max_tokens  as number,
+    temperature: config.llm.judge.temperature as number,
+    throttle_ms: (config.llm.judge.throttle_ms ?? 600) as number,
+  };
+  const coverLetterConfig: CoverLetterConfig = {
+    model:       config.llm.cover_letter.model       as string,
+    max_tokens:  config.llm.cover_letter.max_tokens  as number,
+    temperature: config.llm.cover_letter.temperature as number,
+    throttle_ms: (config.llm.cover_letter.throttle_ms ?? 1000) as number,
+    ...(config.llm.cover_letter.thinking
+      ? { thinking: config.llm.cover_letter.thinking as { type: "enabled"; budget_tokens: number } }
+      : {}),
+  };
   const scoringWeights: ScoringWeights = config.scoring?.weights ?? {
     skills: 0.35, semantic: 0.25, yoe: 0.15, seniority: 0.15, location: 0.10,
   };
@@ -112,13 +144,24 @@ async function main(): Promise<void> {
   const aliases    = buildAliasMap(skillsJson);
   log(`Skill aliases loaded: ${Object.keys(aliases).length} entries`);
 
+  // --- Load resume (resume.tex preferred, falls back to resume.md) ---
+  const resumeText = loadResume(CONFIG_DIR);
+  if (resumeText) {
+    log(`Resume loaded (${resumeText.length} chars) — cover letters will use real background`);
+  } else {
+    log(`No resume found — add config/resume.tex to get specific, achievement-backed cover letters`);
+  }
+
   if (DO_EXTRACT) {
     if (!process.env.OPENROUTER_API_KEY) {
       die("EXTRACT=1 set but OPENROUTER_API_KEY not found.\nAdd it to .env or export it.");
     }
-    log(`Extraction enabled — model: ${extractorConfig.model}`);
+    log(`Extraction enabled  — model: ${extractorConfig.model}`);
+    log(`Judge enabled       — model: ${judgeConfig.model}`);
+    log(`Cover letter enabled— model: ${coverLetterConfig.model}`);
   } else {
     log("Extraction disabled (set EXTRACT=1 to enable)");
+    log("Judge/Cover letter disabled (auto-enabled with EXTRACT=1)");
   }
 
   // --- Profile embedding (once at startup, reused for all jobs) ---
@@ -144,8 +187,9 @@ async function main(): Promise<void> {
   const nowIso  = new Date().toISOString();
   const results = await processJobs(
     jsonlPath, profile, aliases,
-    extractorConfig, scoringWeights, scoringThreshold,
-    profileEmbedding, nowIso,
+    extractorConfig, judgeConfig, coverLetterConfig,
+    scoringWeights, scoringThreshold,
+    profileEmbedding, resumeText, nowIso,
   );
 
   printResults(results, SOURCE, scoringThreshold);
@@ -215,17 +259,28 @@ interface JobResult {
   extract_status?: string;
   // Populated after scoring (only when SCORE=1 or EXTRACT=1)
   score?:        ScoreResult;
+  // Populated after judge (Stage 13-14, only for GATE_PASS when JUDGE=1)
+  judge_verdict?:   string | null;
+  judge_reasoning?: string | null;
+  judge_concerns?:  string[];
+  bucket?:          FinalBucket;
+  // Populated after cover letter (Stage 15, only for COVER_LETTER bucket)
+  cover_letter_path?: string | null;
+  cover_letter_words?: number | null;
 }
 
 async function processJobs(
-  jsonlPath:        string,
-  profile:          unknown,
-  aliases:          Record<string, string>,
-  extractorConfig:  { model: string; max_tokens: number; temperature: number; throttle_ms: number },
-  scoringWeights:   ScoringWeights,
-  scoringThreshold: number,
-  profileEmbedding: Float32Array | null,
-  nowIso:           string,
+  jsonlPath:           string,
+  profile:             unknown,
+  aliases:             Record<string, string>,
+  extractorConfig:     { model: string; max_tokens: number; temperature: number; throttle_ms: number },
+  judgeConfigArg:      { model: string; max_tokens: number; temperature: number; throttle_ms: number },
+  coverLetterConfigArg: CoverLetterConfig,
+  scoringWeights:      ScoringWeights,
+  scoringThreshold:    number,
+  profileEmbedding:    Float32Array | null,
+  resumeText:          string | null,
+  nowIso:              string,
 ): Promise<JobResult[]> {
   const results: JobResult[] = [];
 
@@ -388,10 +443,10 @@ async function processJobs(
     }
 
     // Stage 12 — threshold gate
-    // gate_passed jobs proceed to LLM judge (not yet built).
+    // gate_passed jobs proceed to the LLM judge.
     // gate_fail → ARCHIVE bucket.
     // When scoring is disabled, all PASS jobs go through as PASS (no gate).
-    const finalVerdict = scoreResult
+    const gateVerdict = scoreResult
       ? (scoreResult.gate_passed ? "GATE_PASS" : "ARCHIVE")
       : "PASS";
 
@@ -400,19 +455,150 @@ async function processJobs(
     // (snapshotted before extraction). Merge live flags with post-fetch checks.
     const allFlags = [...new Set([...(sanitized.meta?.flags ?? []), ...checked])];
 
+    // Stage 13–14 — LLM judge + routing (GATE_PASS only)
+    let judgeResult: JudgeResult | undefined;
+    let bucket: FinalBucket | undefined;
+    let finalVerdict = gateVerdict;
+
+    if (DO_JUDGE && gateVerdict === "GATE_PASS" && scoreResult) {
+      // Throttle between LLM calls
+      if (judgeConfigArg.throttle_ms > 0) {
+        await new Promise(r => setTimeout(r, judgeConfigArg.throttle_ms));
+      }
+
+      log(`  Judging...`);
+      const judgeInput: JudgeInput = {
+        job: {
+          title:             sanitized.title          ?? "",
+          company:           sanitized.company?.name  ?? "",
+          employment_type:   sanitized.employment_type ?? null,
+          seniority:         sanitized.seniority       ?? null,
+          domain:            sanitized.domain          ?? null,
+          required_skills:   (sanitized.required_skills ?? []).map((s: any) => ({
+            name:           s.name,
+            importance:     s.importance ?? "required",
+            years_required: s.years_required ?? null,
+          })),
+          years_experience:  {
+            min: sanitized.years_experience?.min ?? null,
+            max: sanitized.years_experience?.max ?? null,
+          },
+          education_required: {
+            minimum: sanitized.education_required?.minimum ?? "",
+            field:   sanitized.education_required?.field   ?? "",
+          },
+          visa_sponsorship:  sanitized.visa_sponsorship ?? null,
+          responsibilities:  sanitized.responsibilities  ?? [],
+          flags:             allFlags,
+        },
+        score: {
+          total:      scoreResult.score,
+          components: {
+            skills:    scoreResult.components.skills,
+            semantic:  scoreResult.components.semantic,
+            yoe:       scoreResult.components.yoe,
+            seniority: scoreResult.components.seniority,
+            location:  scoreResult.components.location,
+          },
+        },
+      };
+
+      judgeResult = await judge(judgeInput, judgeConfigArg);
+      bucket      = getBucket(judgeResult, scoreResult.score);
+      finalVerdict = gateVerdict;   // still GATE_PASS for the raw record; bucket is the real routing
+
+      if (judgeResult.status === "ok") {
+        log(`  Judge: ${judgeResult.verdict} → ${bucket}`);
+        if (judgeResult.fields?.concerns.length) {
+          log(`  Concerns: ${judgeResult.fields.concerns.join("; ")}`);
+        }
+      } else {
+        log(`  Judge error: ${judgeResult.error} → ${bucket}`);
+        allFlags.push("judge_failed");
+      }
+    }
+
+    // Stage 15 — Cover letter (COVER_LETTER bucket only)
+    let coverLetterPath: string | null  = null;
+    let coverLetterWords: number | null = null;
+
+    if (DO_COVER && bucket === "COVER_LETTER" && scoreResult) {
+      if (coverLetterConfigArg.throttle_ms > 0) {
+        await new Promise(r => setTimeout(r, coverLetterConfigArg.throttle_ms));
+      }
+
+      log(`  Writing cover letter...`);
+      const clInput: CoverLetterInput = {
+        job: {
+          job_id:           sanitized.meta?.job_id ?? `job-${jobNum}`,
+          title:            sanitized.title         ?? "",
+          company:          sanitized.company?.name ?? "",
+          domain:           sanitized.domain        ?? null,
+          employment_type:  sanitized.employment_type ?? null,
+          required_skills:  (sanitized.required_skills ?? []).map((s: any) => ({
+            name:           s.name,
+            importance:     s.importance ?? "required",
+            years_required: s.years_required ?? null,
+          })),
+          responsibilities: sanitized.responsibilities ?? [],
+          yoe_min:          sanitized.years_experience?.min ?? null,
+          yoe_max:          sanitized.years_experience?.max ?? null,
+          visa_sponsorship: sanitized.visa_sponsorship ?? null,
+          score:            scoreResult.score,
+          score_components: {
+            skills:    scoreResult.components.skills,
+            semantic:  scoreResult.components.semantic,
+            yoe:       scoreResult.components.yoe,
+            seniority: scoreResult.components.seniority,
+            location:  scoreResult.components.location,
+          },
+          judge_reasoning: judgeResult?.fields?.reasoning ?? null,
+          judge_concerns:  judgeResult?.fields?.concerns  ?? [],
+        },
+        profile: {
+          skills:            (profile as any).skills ?? [],
+          years_experience:  (profile as any).years_experience ?? 0,
+          education:         (profile as any).education ?? { degree: "bachelor", field: "" },
+          preferred_domains: (profile as any).preferred_domains ?? [],
+        },
+        resume: resumeText,
+      };
+
+      const clResult = await generateCoverLetter(clInput, coverLetterConfigArg);
+      if (clResult.status === "ok" && clResult.text) {
+        try {
+          coverLetterPath  = saveCoverLetter(clResult, clInput, COVER_OUT_DIR);
+          coverLetterWords = clResult.word_count ?? null;
+          log(`  Cover letter: ${coverLetterPath} (${coverLetterWords} words)`);
+        } catch (e) {
+          log(`  Cover letter save failed: ${e}`);
+          allFlags.push("cover_letter_save_failed");
+        }
+      } else {
+        log(`  Cover letter generation failed: ${clResult.error}`);
+        allFlags.push("cover_letter_failed");
+      }
+    }
+
     results.push({
-      title:          sanitized.title         ?? "",
-      company:        sanitized.company?.name ?? "",
-      verdict:        finalVerdict,
-      reason:         null,
-      flags:          allFlags,
-      skills:         skills.length ? skills : undefined,
-      yoe_min:        yoeMin,
-      yoe_max:        yoeMax,
-      domain:         domain ?? undefined,
-      fetch_status:   fetchStatus,
-      extract_status: extractStatus,
-      score:          scoreResult,
+      title:               sanitized.title         ?? "",
+      company:             sanitized.company?.name ?? "",
+      verdict:             finalVerdict,
+      reason:              null,
+      flags:               allFlags,
+      skills:              skills.length ? skills : undefined,
+      yoe_min:             yoeMin,
+      yoe_max:             yoeMax,
+      domain:              domain ?? undefined,
+      fetch_status:        fetchStatus,
+      extract_status:      extractStatus,
+      score:               scoreResult,
+      judge_verdict:       judgeResult?.verdict   ?? null,
+      judge_reasoning:     judgeResult?.fields?.reasoning ?? null,
+      judge_concerns:      judgeResult?.fields?.concerns  ?? [],
+      bucket,
+      cover_letter_path:   coverLetterPath,
+      cover_letter_words:  coverLetterWords,
     });
   }
 
@@ -431,8 +617,11 @@ function printResults(results: JobResult[], source: string, threshold: number): 
   console.log(SEP);
 
   for (const r of results) {
-    const icon = r.verdict === "REJECT" ? "✗"
-               : r.verdict === "ARCHIVE" ? "○"
+    const icon = r.verdict === "REJECT"                    ? "✗"
+               : r.verdict === "ARCHIVE"                   ? "○"
+               : r.bucket  === "COVER_LETTER"              ? "★"
+               : r.bucket  === "REVIEW_QUEUE"              ? "?"
+               : r.bucket  === "ARCHIVE"                   ? "○"
                : "✓";
 
     const title   = pad(r.title,   42);
@@ -443,6 +632,9 @@ function printResults(results: JobResult[], source: string, threshold: number): 
       detail = `REJECT  ${r.reason ?? ""}`;
     } else if (r.verdict === "ARCHIVE") {
       detail = `ARCHIVE  score=${r.score?.score.toFixed(3) ?? "?"}`;
+    } else if (r.verdict === "GATE_PASS" && r.bucket) {
+      const judgeTag = r.judge_verdict ? ` [${r.judge_verdict}]` : "";
+      detail = `${r.bucket}${judgeTag}  score=${r.score?.score.toFixed(3) ?? "?"}`;
     } else if (r.verdict === "GATE_PASS") {
       detail = `GATE_PASS  score=${r.score?.score.toFixed(3) ?? "?"}`;
     } else {
@@ -462,6 +654,16 @@ function printResults(results: JobResult[], source: string, threshold: number): 
       );
     }
 
+    // Show judge reasoning when present
+    if (r.judge_reasoning) {
+      console.log(`       judge:  ${r.judge_reasoning}`);
+    }
+
+    // Show cover letter path when generated
+    if (r.cover_letter_path) {
+      console.log(`       cover:  ${r.cover_letter_path} (${r.cover_letter_words} words)`);
+    }
+
     // Show extracted skills
     if ((r.verdict === "GATE_PASS" || r.verdict === "PASS") && r.skills?.length) {
       const yoe = r.yoe_min != null
@@ -473,10 +675,15 @@ function printResults(results: JobResult[], source: string, threshold: number): 
   }
 
   // Summary
-  const passed    = results.filter(r => r.verdict === "PASS");
+  const passed     = results.filter(r => r.verdict === "PASS");
   const gatePassed = results.filter(r => r.verdict === "GATE_PASS");
-  const archived  = results.filter(r => r.verdict === "ARCHIVE");
-  const rejected  = results.filter(r => r.verdict === "REJECT");
+  const archived   = results.filter(r => r.verdict === "ARCHIVE");
+  const rejected   = results.filter(r => r.verdict === "REJECT");
+
+  const coverLetter  = results.filter(r => r.bucket === "COVER_LETTER");
+  const resultsQueue = results.filter(r => r.bucket === "RESULTS");
+  const reviewQueue  = results.filter(r => r.bucket === "REVIEW_QUEUE");
+  const archiveBucket = results.filter(r => r.bucket === "ARCHIVE");
 
   console.log(`\n${SEP}`);
   console.log(`  SUMMARY`);
@@ -484,7 +691,15 @@ function printResults(results: JobResult[], source: string, threshold: number): 
   console.log(`  Total        ${results.length}`);
   console.log(`  Passed       ${passed.length + gatePassed.length}  (hard filter pass)`);
   if (DO_SCORE) {
-    console.log(`  Gate PASS    ${gatePassed.length}  (score >= ${threshold})  → ready for LLM judge`);
+    if (DO_JUDGE && gatePassed.length > 0) {
+      console.log(`  Gate PASS    ${gatePassed.length}  (score >= ${threshold})`);
+      console.log(`  ├─ COVER_LETTER  ${coverLetter.length}   STRONG + score ≥ 0.70`);
+      console.log(`  ├─ RESULTS       ${resultsQueue.length}   STRONG + score < 0.70`);
+      console.log(`  ├─ REVIEW_QUEUE  ${reviewQueue.length}   MAYBE`);
+      console.log(`  └─ ARCHIVE       ${archiveBucket.length}   WEAK or judge error`);
+    } else {
+      console.log(`  Gate PASS    ${gatePassed.length}  (score >= ${threshold})`);
+    }
     console.log(`  Archive      ${archived.length}  (score < ${threshold})`);
   }
   console.log(`  Rejected     ${rejected.length}  (hard filter reject)`);
@@ -531,6 +746,18 @@ function printResults(results: JobResult[], source: string, threshold: number): 
     const fetchFail = allPassed.filter(r => r.fetch_status   === "error");
     console.log(`\n  Extraction: ${extracted.length}/${allPassed.length} successful`);
     if (fetchFail.length) console.log(`  Fetch failures: ${fetchFail.length}`);
+  }
+
+  if (DO_COVER) {
+    const letters = results.filter(r => r.cover_letter_path);
+    if (letters.length) {
+      console.log(`\n  Cover letters written: ${letters.length}`);
+      for (const r of letters) {
+        console.log(`    ${r.title} @ ${r.company} → ${r.cover_letter_path}`);
+      }
+    } else if (coverLetter.length === 0) {
+      console.log(`\n  Cover letters: none (no COVER_LETTER bucket jobs this run)`);
+    }
   }
 
   console.log(`${SEP}\n`);
