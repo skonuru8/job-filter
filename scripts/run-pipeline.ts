@@ -97,7 +97,19 @@ const DO_JUDGE       = DO_EXTRACT || Boolean(process.env.JUDGE);  // auto when e
 const DO_COVER       = DO_EXTRACT || Boolean(process.env.COVER);  // auto when extract runs
 const SAVE_FIXTURES  = Boolean(process.env.SAVE_FIXTURES); // save real extraction fixtures
 const SKIP_DEDUP     = Boolean(process.env.SKIP_DEDUP);    // bypass Redis + pgvector dedup
-const SKIP_PERSIST   = Boolean(process.env.SKIP_PERSIST);  // bypass Postgres persistence
+const SKIP_PERSIST   = Boolean(process.env.SKIP_PERSIST);  // bypass Postgres persistence 
+
+// Dice-only env vars. Both passed through to the scraper subprocess.
+//   QUERY="java developer"          search term (default below)
+//   POSTED_WITHIN=ONE|THREE|SEVEN   server-side recency filter:
+//                                     ONE   = jobs posted in last 24h
+//                                     THREE = jobs posted in last 3 days
+//                                     SEVEN = jobs posted in last 7 days
+//                                     unset = no filter (all listings)
+// Use POSTED_WITHIN=ONE for cron runs to only pull genuinely new jobs.
+const QUERY          = process.env.QUERY ?? "java developer";
+const POSTED_WITHIN  = process.env.POSTED_WITHIN ?? "";   // "" = no filter
+
 const FIXTURES_DIR   = path.join(PROJECT_ROOT, "extractor", "fixtures");
 const CONFIG_DIR     = path.join(PROJECT_ROOT, "config");
 const RUN_ID = new Date().toISOString().replace(/[:.]/g, "-");
@@ -219,7 +231,10 @@ async function main(): Promise<void> {
   }
 
   // --- Scrape or use existing JSONL ---
-  const jsonlPath = JSONL_OVERRIDE ? JSONL_OVERRIDE : runScraper(SOURCE, MAX_JOBS, HEADED);
+  const jsonlPath = JSONL_OVERRIDE
+  ? JSONL_OVERRIDE
+  : runScraper(SOURCE, MAX_JOBS, HEADED, QUERY, POSTED_WITHIN);
+
   if (!fs.existsSync(jsonlPath)) die(`JSONL not found: ${jsonlPath}`);
   log(`Reading: ${jsonlPath}`);
 
@@ -262,28 +277,44 @@ async function main(): Promise<void> {
 // Scraper spawn
 // ---------------------------------------------------------------------------
 
-function runScraper(source: string, maxJobs: number, headed: boolean): string {
+function runScraper(
+  source:        string,
+  maxJobs:       number,
+  headed:        boolean,
+  query:         string,
+  postedWithin:  string,
+): string {
   const args = [
     "-m", "scraper",
     "--source", source,
     "--max",    String(maxJobs),
     ...(headed ? ["--headed"] : []),
   ];
+ 
+  // Dice-only flags. Other sources ignore them (cli.py only passes them to dice).
+  if (source === "dice") {
+    args.push("--query", query);
+    if (postedWithin) {
+      args.push("--posted-within", postedWithin);
+    }
+  }
+ 
   log(`Spawning: python ${args.join(" ")}`);
-
+ 
   const result = spawnSync("python", args, {
     cwd: PROJECT_ROOT, encoding: "utf-8", stdio: ["ignore", "pipe", "pipe"],
   });
-
+ 
   if (result.stderr) process.stderr.write(result.stderr);
-
+ 
   if (result.status === 2) die(`Cookie file missing — config/cookies/${source}.json`);
   if (result.status !== 0) die(`Scraper exited with code ${result.status}`);
-
+ 
   const jsonlPath = findNewestJsonl(source);
   if (!jsonlPath) die(`No JSONL in ${SCRAPER_OUT_DIR} for source "${source}"`);
   return jsonlPath!;
 }
+
 
 function findNewestJsonl(source: string): string | null {
   if (!fs.existsSync(SCRAPER_OUT_DIR)) return null;
