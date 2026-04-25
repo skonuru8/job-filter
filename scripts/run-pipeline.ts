@@ -55,6 +55,16 @@ import { generateCoverLetter, saveCoverLetter } from "../../cover-letter/src/gen
 import { loadResume } from "../../cover-letter/src/resume";
 import type { CoverLetterInput, CoverLetterConfig } from "../../cover-letter/src/types";
 
+// Dedup + storage — gracefully disabled via SKIP_DEDUP=1 / SKIP_PERSIST=1
+import {
+  connectRedis, disconnectRedis, isSeen, markSeen,
+  findSemanticDuplicate,
+} from "../../dedup/src/index";
+import {
+  runMigrations, saveRun, finishRun, saveJob, closePool,
+} from "../../storage/src/index";
+import type { JobRecord } from "../../storage/src/types";
+
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -86,6 +96,8 @@ const DO_SCORE       = DO_EXTRACT || Boolean(process.env.SCORE);  // auto when e
 const DO_JUDGE       = DO_EXTRACT || Boolean(process.env.JUDGE);  // auto when extract runs
 const DO_COVER       = DO_EXTRACT || Boolean(process.env.COVER);  // auto when extract runs
 const SAVE_FIXTURES  = Boolean(process.env.SAVE_FIXTURES); // save real extraction fixtures
+const SKIP_DEDUP     = Boolean(process.env.SKIP_DEDUP);    // bypass Redis + pgvector dedup
+const SKIP_PERSIST   = Boolean(process.env.SKIP_PERSIST);  // bypass Postgres persistence
 const FIXTURES_DIR   = path.join(PROJECT_ROOT, "extractor", "fixtures");
 const CONFIG_DIR     = path.join(PROJECT_ROOT, "config");
 const RUN_ID = new Date().toISOString().replace(/[:.]/g, "-");
@@ -174,6 +186,24 @@ async function main(): Promise<void> {
     log("Judge/Cover letter disabled (auto-enabled with EXTRACT=1)");
   }
 
+  // --- Storage + dedup init (non-fatal — pipeline continues if unavailable) ---
+  if (!SKIP_DEDUP) {
+    await connectRedis();
+  } else {
+    log("Dedup disabled (SKIP_DEDUP=1)");
+  }
+  if (!SKIP_PERSIST) {
+    try {
+      await runMigrations();
+      await saveRun({ run_id: RUN_ID, source: SOURCE, started_at: new Date().toISOString() });
+      log(`Run record saved: ${RUN_ID}`);
+    } catch (e: any) {
+      log(`Storage init failed (continuing without persistence): ${e.message}`);
+    }
+  } else {
+    log("Persistence disabled (SKIP_PERSIST=1)");
+  }
+
   // --- Profile embedding (once at startup, reused for all jobs) ---
   let profileEmbedding: Float32Array | null = null;
   if (DO_SCORE) {
@@ -204,13 +234,28 @@ async function main(): Promise<void> {
 
   printResults(results, SOURCE, scoringThreshold);
 
-  // --- Save results to disk ---
+  // --- Save results to disk (JSONL — always written when EXTRACT=1) ---
   if (DO_EXTRACT) {
-      const outPath = path.join(SCRAPER_OUT_DIR, `results_${SOURCE}_${RUN_ID}.jsonl`);
-      const lines = results.map(r => JSON.stringify(r)).join("\n");
-      fs.writeFileSync(outPath, lines + "\n", "utf-8");
-      log(`Results saved: ${outPath}`);
+    const outPath = path.join(SCRAPER_OUT_DIR, `results_${SOURCE}_${RUN_ID}.jsonl`);
+    const lines = results.map(r => JSON.stringify(r)).join("\n");
+    fs.writeFileSync(outPath, lines + "\n", "utf-8");
+    log(`Results saved: ${outPath}`);
   }
+
+  // --- Finish run record in Postgres ---
+  if (!SKIP_PERSIST) {
+    await finishRun(RUN_ID, {
+      finished_at:  new Date().toISOString(),
+      jobs_total:   results.length,
+      jobs_passed:  results.filter(r => r.verdict !== "REJECT" && r.verdict !== "DEDUP").length,
+      jobs_gated:   results.filter(r => r.verdict === "GATE_PASS").length,
+      jobs_covered: results.filter(r => r.cover_letter_path != null).length,
+    });
+  }
+
+  // --- Disconnect ---
+  if (!SKIP_DEDUP)   await disconnectRedis();
+  if (!SKIP_PERSIST) await closePool();
 }
 
 // ---------------------------------------------------------------------------
@@ -351,9 +396,47 @@ async function processJobs(
   }
 
   // ---------------------------------------------------------------------------
+  // Stage 2 — Cross-run exact dedup (Redis)
+  //
+  // Batch-checks every PASS job_id against the Redis seen-set.
+  // Jobs seen in a recent run (7-day TTL) are moved to the `dedups` list and
+  // skipped from expensive fetch/extract/judge/cover-letter stages.
+  // Gracefully disabled when SKIP_DEDUP=1 or Redis is unreachable.
+  // ---------------------------------------------------------------------------
+  const dedups: Array<{ jobNum: number; result: JobResult }> = [];
+
+  if (!SKIP_DEDUP) {
+    const seenFlags = await Promise.all(
+      passQueue.map(e => isSeen(SOURCE, e.sanitized.meta?.job_id ?? "")),
+    );
+    const remaining: typeof passQueue = [];
+    for (let i = 0; i < passQueue.length; i++) {
+      if (seenFlags[i]) {
+        const { jobNum: n, sanitized: s } = passQueue[i];
+        log(`[${n}] DEDUP: ${s.title} @ ${s.company?.name} (seen in a recent run)`);
+        dedups.push({
+          jobNum: n,
+          result: {
+            title:      s.title         ?? "",
+            company:    s.company?.name ?? "",
+            source_url: s.meta?.source_url ?? null,
+            verdict:    "DEDUP",
+            reason:     "already_processed",
+            flags:      [],
+          },
+        });
+      } else {
+        remaining.push(passQueue[i]);
+      }
+    }
+    passQueue.length = 0;
+    passQueue.push(...remaining);
+  }
+
+  // ---------------------------------------------------------------------------
   // Phase 2 — concurrent async processing of PASS jobs (fetch→extract→score→judge)
   //
-  // pLimit(3): at most 3 jobs running concurrently. Keeps Dice HTTP and
+  // pLimit(5): at most 5 jobs running concurrently. Keeps Dice HTTP and
   // OpenRouter LLM load reasonable without serialising everything.
   // ---------------------------------------------------------------------------
   const limit = pLimit(5);
@@ -467,8 +550,8 @@ async function processJobs(
     // a misleading ~0.85 score and wastes a downstream judge LLM call.
     const extractionFailed = DO_EXTRACT && extractStatus === "error";
     let scoreResult: ScoreResult | undefined;
+    let jobEmbedding: Float32Array | null = null;  // hoisted — also used by pgvector dedup + persist
     if (DO_SCORE && !extractionFailed) {
-      let jobEmbedding: Float32Array | null = null;
       try {
         jobEmbedding = await embedJob(sanitized);
       } catch {
@@ -512,6 +595,19 @@ async function processJobs(
     // reassign bucket after the judge runs.
     let bucket: FinalBucket | undefined = gateVerdict === "ARCHIVE" ? "ARCHIVE" : undefined;
     let finalVerdict = gateVerdict;
+
+    // Stage 12.5 — pgvector cross-site semantic dedup
+    // Only runs on GATE_PASS jobs with an embedding — avoids calling the
+    // judge on a job that's semantically identical to one we already processed.
+    if (!SKIP_DEDUP && jobEmbedding && gateVerdict === "GATE_PASS") {
+      const dupJobId = await findSemanticDuplicate(Array.from(jobEmbedding), RUN_ID);
+      if (dupJobId) {
+        log(`[${n}]  Semantic dup of job ${dupJobId} → ARCHIVE`);
+        allFlags.push("semantic_duplicate");
+        bucket       = "ARCHIVE";
+        finalVerdict = "ARCHIVE";
+      }
+    }
 
     if (DO_JUDGE && gateVerdict === "GATE_PASS" && scoreResult) {
       // Throttle between LLM calls
@@ -646,6 +742,55 @@ async function processJobs(
       }
     }
 
+    // Stage 16 — persist to Postgres + mark seen in Redis
+    // Runs after all stages so a mid-run crash doesn't mark the job as seen
+    // prematurely (it would be retried on the next run).
+    const jobId = (sanitized.meta?.job_id as string | undefined) ?? `job-${n}`;
+
+    if (!SKIP_PERSIST) {
+      const jobRecord: JobRecord = {
+        job_id:          jobId,
+        run_id:          RUN_ID,
+        source:          SOURCE,
+        source_url:      sanitized.meta?.source_url    ?? null,
+        title:           sanitized.title               ?? null,
+        company:         sanitized.company?.name       ?? null,
+        posted_at:       sanitized.meta?.posted_at     ?? null,
+        scraped_at:      sanitized.meta?.scraped_at    ?? null,
+        description_raw: sanitized.description_raw     ?? null,
+        meta:            sanitized.meta                ?? null,
+        extracted:       sanitized.required_skills?.length
+                           ? { required_skills: sanitized.required_skills,
+                               years_experience: sanitized.years_experience,
+                               domain: sanitized.domain,
+                               responsibilities: sanitized.responsibilities }
+                           : null,
+        embedding:       jobEmbedding ? Array.from(jobEmbedding) : null,
+        filter_verdict:  finalVerdict,
+        filter_flags:    allFlags,
+        score: scoreResult ? {
+          total:     scoreResult.score,
+          skills:    scoreResult.components.skills,
+          semantic:  scoreResult.components.semantic,
+          yoe:       scoreResult.components.yoe,
+          seniority: scoreResult.components.seniority,
+          location:  scoreResult.components.location,
+        } : null,
+        judge_verdict:   judgeResult?.verdict            ?? null,
+        judge_bucket:    bucket                          ?? null,
+        judge_reasoning: judgeResult?.fields?.reasoning  ?? null,
+        judge_concerns:  judgeResult?.fields?.concerns   ?? [],
+        cover_letter_path:  coverLetterPath,
+        cover_letter_words: coverLetterWords,
+        cover_letter_model: coverLetterPath ? coverLetterConfigArg.model : null,
+      };
+      await saveJob(jobRecord);
+    }
+
+    if (!SKIP_DEDUP) {
+      await markSeen(SOURCE, jobId);
+    }
+
     return {
       jobNum: n,
       result: {
@@ -672,9 +817,9 @@ async function processJobs(
     };
   })); // end limit()
 
-  // Merge rejects + pass results, sort by original jobNum to preserve input order
+  // Merge rejects + dedups + pass results, sort by original jobNum to preserve input order
   const passResults = await Promise.all(passPromises);
-  return [...rejects, ...passResults]
+  return [...rejects, ...dedups, ...passResults]
     .sort((a, b) => a.jobNum - b.jobNum)
     .map(r => r.result);
 }
@@ -692,11 +837,13 @@ function printResults(results: JobResult[], source: string, threshold: number): 
 
   for (const r of results) {
     const icon = r.verdict === "REJECT"                    ? "✗"
+               : r.verdict === "DEDUP"                     ? "↩"
                : r.verdict === "ARCHIVE"                   ? "○"
                : r.bucket  === "COVER_LETTER"              ? "★"
+               : r.bucket  === "RESULTS"                   ? "✓"
                : r.bucket  === "REVIEW_QUEUE"              ? "?"
                : r.bucket  === "ARCHIVE"                   ? "○"
-               : "✓";
+               : "·";
 
     const title   = pad(r.title,   42);
     const company = pad(r.company, 22);
@@ -753,6 +900,7 @@ function printResults(results: JobResult[], source: string, threshold: number): 
   const gatePassed = results.filter(r => r.verdict === "GATE_PASS");
   const archived   = results.filter(r => r.verdict === "ARCHIVE");
   const rejected   = results.filter(r => r.verdict === "REJECT");
+  const deduped    = results.filter(r => r.verdict === "DEDUP");
 
   const coverLetter  = results.filter(r => r.bucket === "COVER_LETTER");
   const resultsQueue = results.filter(r => r.bucket === "RESULTS");
@@ -777,6 +925,9 @@ function printResults(results: JobResult[], source: string, threshold: number): 
     console.log(`  Archive      ${archived.length}  (score < ${threshold})`);
   }
   console.log(`  Rejected     ${rejected.length}  (hard filter reject)`);
+  if (deduped.length) {
+    console.log(`  Deduped      ${deduped.length}  (seen in recent run — skipped)`);
+  }
 
   if (DO_SCORE && (gatePassed.length + archived.length) > 0) {
     const scored = [...gatePassed, ...archived];
