@@ -33,6 +33,7 @@ import { spawnSync }     from "child_process";
 import * as fs           from "fs";
 import * as path         from "path";
 import { fileURLToPath } from "url";
+import { randomUUID }    from "crypto";
 import { config as loadEnv } from "dotenv";
 import pLimit            from "p-limit";
 
@@ -112,7 +113,7 @@ const POSTED_WITHIN  = process.env.POSTED_WITHIN ?? "";   // "" = no filter
 
 const FIXTURES_DIR   = path.join(PROJECT_ROOT, "extractor", "fixtures");
 const CONFIG_DIR     = path.join(PROJECT_ROOT, "config");
-const RUN_ID = new Date().toISOString().replace(/[:.]/g, "-");
+const RUN_ID = process.env.RUN_ID ?? randomUUID();
 // Each run gets its own subdirectory — old runs are never touched.
 // Bucket subfolders (COVER_LETTER / REVIEW_QUEUE) let you triage at a glance.
 const COVER_OUT_BASE = path.join(PROJECT_ROOT, "output", "cover-letters");
@@ -265,6 +266,8 @@ async function main(): Promise<void> {
       jobs_passed:  results.filter(r => r.verdict !== "REJECT" && r.verdict !== "DEDUP").length,
       jobs_gated:   results.filter(r => r.verdict === "GATE_PASS").length,
       jobs_covered: results.filter(r => r.cover_letter_path != null).length,
+      extractions_attempted: results.filter(r => r.extract_status === "ok" || r.extract_status === "error").length,
+      extractions_succeeded: results.filter(r => r.extract_status === "ok").length,
     });
   }
 
