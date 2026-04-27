@@ -382,9 +382,16 @@ async function processJobs(
 
   // Shared fixture counter. Increment is always in a synchronous block after
   // an await, so JS single-threaded scheduling keeps it race-free.
+  // Seed counter from existing real-data fixtures on disk so the cap
+  // (count < 5) is GLOBAL across runs, not per-run. Otherwise unattended
+  // mode would write up to 5 new files every run forever.
   const fixtureRef = {
     count: SAVE_FIXTURES
-      ? fs.readdirSync(FIXTURES_DIR).filter(f => f.startsWith("jd-real-") && f.endsWith("-input.txt")).length
+      ? (fs.existsSync(FIXTURES_DIR)
+          ? fs.readdirSync(FIXTURES_DIR)
+              .filter(f => /^jd-real-\d+-.*-input\.txt$/.test(f))
+              .length
+          : 0)
       : 0,
   };
 
