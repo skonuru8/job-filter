@@ -486,8 +486,18 @@ async function processJobs(
     limit(async (): Promise<{ jobNum: number; result: JobResult }> => {
 
       // Stage 5 — fetch JD
-      let fetchStatus = "skipped";
-      if (DO_EXTRACT) {
+      // Sources like jobright_api populate description_raw at scrape time
+      // by synthesizing it from structured API fields. In that case the
+      // apply URL is a downstream ATS link (Oracle/Workday/Phenom/etc.)
+      // that returns near-empty HTML to a plain HTTP fetcher anyway.
+      // Skip the fetch when the scraper has already provided substantive prose.
+      const PRESCRAPED_MIN_CHARS = 200;
+      let fetchStatus: "ok" | "error" | "skipped" = "skipped";
+
+      if (sanitized.description_raw && sanitized.description_raw.trim().length >= PRESCRAPED_MIN_CHARS) {
+        fetchStatus = "ok";
+        log(`[${n}]  Description provided by scraper (${sanitized.description_raw.trim().length} chars), skipping fetch`);
+      } else if (DO_EXTRACT) {
         log(`[${n}]  Fetching: ${sanitized.meta?.source_url}`);
         const fetchResult = await fetchJobPage(sanitized.meta?.source_url ?? "");
         fetchStatus = fetchResult.status;
